@@ -1,12 +1,18 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from postgrest.exceptions import APIError
 from supabase import Client
 
-from app.dependencies import get_authenticated_supabase, get_current_user
+from app.dependencies import get_authenticated_supabase, get_current_user, get_supabase_admin
 from app.schemas.businesses import (
+    BusinessCategoryCreate,
     BusinessCategoryOut,
     BusinessCreate,
     BusinessOut,
+    BusinessSubcategoryCreate,
+    BusinessSubcategoryLinkBody,
+    BusinessSubcategoryOut,
     BusinessUpdate,
 )
 
@@ -20,6 +26,163 @@ def list_categories(
 ):
     response = supabase.table("business_categories").select("*").execute()
     return response.data
+
+
+@router.post(
+    "/categories",
+    response_model=BusinessCategoryOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_category(
+    body: BusinessCategoryCreate,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase_admin),
+):
+    try:
+        response = (
+            supabase.table("business_categories")
+            .insert(body.model_dump(mode="json"))
+            .execute()
+        )
+    except APIError as e:
+        if e.code == "23505":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A category with this name already exists",
+            ) from e
+        raise
+    return response.data[0]
+
+
+@router.get("/subcategories", response_model=list[BusinessSubcategoryOut])
+def list_subcategories(
+    category_id: UUID | None = Query(None),
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    if category_id is not None:
+        # Get subcategory IDs linked to this category
+        links = (
+            supabase.table("business_category_subcategory")
+            .select("subcategory_id")
+            .eq("category_id", str(category_id))
+            .execute()
+        )
+        sub_ids = [link["subcategory_id"] for link in links.data]
+        if not sub_ids:
+            return []
+        rows = (
+            supabase.table("business_subcategories")
+            .select("*, business_category_subcategory(category_id, business_categories(*))")
+            .in_("id", sub_ids)
+            .execute()
+        )
+    else:
+        rows = (
+            supabase.table("business_subcategories")
+            .select("*, business_category_subcategory(category_id, business_categories(*))")
+            .execute()
+        )
+    return [_format_subcategory(row) for row in rows.data]
+
+
+@router.post(
+    "/subcategories",
+    response_model=BusinessSubcategoryOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_subcategory(
+    body: BusinessSubcategoryCreate,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase_admin),
+):
+    try:
+        response = (
+            supabase.table("business_subcategories")
+            .insert({"name": body.name})
+            .execute()
+        )
+    except APIError as e:
+        if e.code == "23505":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A subcategory with this name already exists",
+            ) from e
+        raise
+    subcategory = response.data[0]
+
+    # Link to categories if provided
+    if body.category_ids:
+        link_rows = [
+            {"category_id": str(cid), "subcategory_id": subcategory["id"]}
+            for cid in body.category_ids
+        ]
+        try:
+            supabase.table("business_category_subcategory").insert(link_rows).execute()
+        except APIError as e:
+            if e.code == "23503":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="One or more category_ids do not exist",
+                ) from e
+            raise
+
+    return _fetch_subcategory_with_categories(supabase, subcategory["id"])
+
+
+@router.post(
+    "/categories/{category_id}/subcategories",
+    response_model=BusinessSubcategoryOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def link_subcategory_to_category(
+    category_id: UUID,
+    body: BusinessSubcategoryLinkBody,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase_admin),
+):
+    try:
+        supabase.table("business_category_subcategory").insert(
+            {"category_id": str(category_id), "subcategory_id": str(body.subcategory_id)}
+        ).execute()
+    except APIError as e:
+        if e.code == "23505":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This subcategory is already linked to this category",
+            ) from e
+        if e.code == "23503":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Category or subcategory does not exist",
+            ) from e
+        raise
+
+    return _fetch_subcategory_with_categories(supabase, str(body.subcategory_id))
+
+
+@router.delete(
+    "/categories/{category_id}/subcategories/{subcategory_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def unlink_subcategory_from_category(
+    category_id: UUID,
+    subcategory_id: UUID,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_supabase_admin),
+):
+    response = (
+        supabase.table("business_category_subcategory")
+        .delete()
+        .eq("category_id", str(category_id))
+        .eq("subcategory_id", str(subcategory_id))
+        .execute()
+    )
+    if not response.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Link not found",
+        )
 
 
 @router.post("", response_model=BusinessOut, status_code=status.HTTP_201_CREATED)
@@ -135,6 +298,26 @@ def delete_my_business(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Business not found",
         )
+
+
+def _format_subcategory(row: dict) -> dict:
+    categories = []
+    for link in row.pop("business_category_subcategory", []):
+        cat = link.get("business_categories")
+        if cat:
+            categories.append(cat)
+    row["categories"] = categories
+    return row
+
+
+def _fetch_subcategory_with_categories(supabase: Client, subcategory_id: str) -> dict:
+    response = (
+        supabase.table("business_subcategories")
+        .select("*, business_category_subcategory(category_id, business_categories(*))")
+        .eq("id", subcategory_id)
+        .execute()
+    )
+    return _format_subcategory(response.data[0])
 
 
 def _enrich_with_category(supabase: Client, row: dict) -> dict:

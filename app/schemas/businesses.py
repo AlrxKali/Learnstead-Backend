@@ -4,9 +4,28 @@ from uuid import UUID
 from pydantic import BaseModel
 
 
+class BusinessCategoryCreate(BaseModel):
+    name: str
+
+
 class BusinessCategoryOut(BaseModel):
     id: UUID
     name: str
+
+
+class BusinessSubcategoryCreate(BaseModel):
+    name: str
+    category_ids: list[UUID] = []
+
+
+class BusinessSubcategoryOut(BaseModel):
+    id: UUID
+    name: str
+    categories: list[BusinessCategoryOut] = []
+
+
+class BusinessSubcategoryLinkBody(BaseModel):
+    subcategory_id: UUID
 
 
 class BusinessCreate(BaseModel):
