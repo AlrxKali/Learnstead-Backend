@@ -10,6 +10,7 @@ from app.schemas.businesses import (
     BusinessCategoryOut,
     BusinessCreate,
     BusinessOut,
+    BusinessSubcategoriesSet,
     BusinessSubcategoryCreate,
     BusinessSubcategoryLinkBody,
     BusinessSubcategoryOut,
@@ -221,7 +222,7 @@ def create_business(
             ) from e
         raise
 
-    return _enrich_with_category(supabase, response.data[0])
+    return _enrich(supabase, response.data[0])
 
 
 @router.get("/me", response_model=BusinessOut)
@@ -243,7 +244,7 @@ def get_my_business(
 
     row = response.data[0]
     row["category"] = row.pop("business_categories", None)
-    return row
+    return _enrich_with_subcategories(supabase, row)
 
 
 @router.put("/me", response_model=BusinessOut)
@@ -258,6 +259,36 @@ def update_my_business(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No fields to update",
         )
+
+    # Merge with current row so we can validate the address rule
+    # against the post-update state.
+    existing_resp = (
+        supabase.table("businesses")
+        .select("delivery_mode, city, state, zip_code")
+        .eq("owner_id", str(user.id))
+        .execute()
+    )
+    if not existing_resp.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Business not found",
+        )
+    merged = {**existing_resp.data[0], **updates}
+    if merged.get("delivery_mode") in ("in_person", "hybrid"):
+        missing = [
+            label
+            for label in ("city", "state", "zip_code")
+            if not merged.get(label) or not str(merged[label]).strip()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "city, state, and zip_code are required for "
+                    f"{merged['delivery_mode']} businesses "
+                    f"(missing: {', '.join(missing)})"
+                ),
+            )
 
     try:
         response = (
@@ -279,7 +310,7 @@ def update_my_business(
             detail="Business not found",
         )
 
-    return _enrich_with_category(supabase, response.data[0])
+    return _enrich(supabase, response.data[0])
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
@@ -298,6 +329,54 @@ def delete_my_business(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Business not found",
         )
+
+
+@router.put("/me/subcategories", response_model=BusinessOut)
+def set_my_subcategories(
+    body: BusinessSubcategoriesSet,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    biz_resp = (
+        supabase.table("businesses")
+        .select("id")
+        .eq("owner_id", str(user.id))
+        .execute()
+    )
+    if not biz_resp.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Business not found",
+        )
+    business_id = biz_resp.data[0]["id"]
+
+    # Replace the set: delete existing links, insert the new ones.
+    supabase.table("business_subcategory").delete().eq(
+        "business_id", business_id
+    ).execute()
+
+    if body.subcategory_ids:
+        rows = [
+            {"business_id": business_id, "subcategory_id": str(sid)}
+            for sid in body.subcategory_ids
+        ]
+        try:
+            supabase.table("business_subcategory").insert(rows).execute()
+        except APIError as e:
+            if e.code == "23503":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="One or more subcategory_ids do not exist",
+                ) from e
+            raise
+
+    full = (
+        supabase.table("businesses")
+        .select("*")
+        .eq("id", business_id)
+        .execute()
+    )
+    return _enrich(supabase, full.data[0])
 
 
 def _format_subcategory(row: dict) -> dict:
@@ -332,3 +411,24 @@ def _enrich_with_category(supabase: Client, row: dict) -> dict:
     else:
         row["category"] = None
     return row
+
+
+def _enrich_with_subcategories(supabase: Client, row: dict) -> dict:
+    links = (
+        supabase.table("business_subcategory")
+        .select("subcategory_id, business_subcategories(*)")
+        .eq("business_id", row["id"])
+        .execute()
+    )
+    subcategories: list[dict] = []
+    for link in links.data or []:
+        sub = link.get("business_subcategories")
+        if sub:
+            subcategories.append(sub)
+    row["subcategories"] = subcategories
+    return row
+
+
+def _enrich(supabase: Client, row: dict) -> dict:
+    row = _enrich_with_category(supabase, row)
+    return _enrich_with_subcategories(supabase, row)
