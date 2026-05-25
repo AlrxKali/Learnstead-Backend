@@ -186,6 +186,66 @@ def unlink_subcategory_from_category(
         )
 
 
+@router.get("/discover", response_model=list[BusinessOut])
+def discover_businesses(
+    q: str | None = Query(None),
+    category_id: UUID | None = Query(None),
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    """Listing for parents.
+
+    Returns:
+      - All `delivery_mode = 'online'` businesses, AND
+      - `in_person`/`hybrid` businesses whose zip_code shares the first 3
+        digits with the requesting user's home_zip_code.
+
+    If the user has no home_zip_code set, only online businesses are
+    returned.
+
+    Optional filters:
+      - q: case-insensitive match on name OR description
+      - category_id: exact match on the business category
+    """
+    profile_resp = (
+        supabase.table("profiles")
+        .select("home_zip_code")
+        .eq("id", str(user.id))
+        .execute()
+    )
+    home_zip = (
+        profile_resp.data[0]["home_zip_code"] if profile_resp.data else None
+    )
+    zip_prefix = home_zip[:3] if home_zip else None
+
+    query = supabase.table("businesses").select("*, business_categories(*)")
+
+    if zip_prefix:
+        # Online OR locality-matched in_person/hybrid.
+        # PostgREST uses url-like 'or' syntax for this.
+        query = query.or_(
+            f"delivery_mode.eq.online,"
+            f"and(delivery_mode.in.(in_person,hybrid),zip_code.like.{zip_prefix}*)"
+        )
+    else:
+        query = query.eq("delivery_mode", "online")
+
+    if category_id is not None:
+        query = query.eq("category_id", str(category_id))
+    if q:
+        # Case-insensitive name or description match.
+        like = f"*{q}*"
+        query = query.or_(f"name.ilike.{like},description.ilike.{like}")
+
+    rows = query.order("created_at", desc=True).execute().data
+
+    out: list[dict] = []
+    for row in rows:
+        row["category"] = row.pop("business_categories", None)
+        out.append(_enrich_with_subcategories(supabase, row))
+    return out
+
+
 @router.post("", response_model=BusinessOut, status_code=status.HTTP_201_CREATED)
 def create_business(
     body: BusinessCreate,

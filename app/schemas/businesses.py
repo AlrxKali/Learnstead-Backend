@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, field_validator, model_validator
 
+from app.schemas._validators import normalize_us_zip
+
 DeliveryMode = Literal["online", "in_person", "hybrid"]
 
 
@@ -103,6 +105,11 @@ class BusinessCreate(BaseModel):
     def _normalize_phone(cls, v: str | None) -> str | None:
         return _normalize_us_phone(v)
 
+    @field_validator("zip_code", mode="before")
+    @classmethod
+    def _normalize_zip(cls, v: str | None) -> str | None:
+        return normalize_us_zip(v)
+
     @model_validator(mode="after")
     def _check_consistency(self) -> "BusinessCreate":
         _validate_age_pair(self.min_age, self.max_age)
@@ -132,6 +139,11 @@ class BusinessUpdate(BaseModel):
     @classmethod
     def _normalize_phone(cls, v: str | None) -> str | None:
         return _normalize_us_phone(v)
+
+    @field_validator("zip_code", mode="before")
+    @classmethod
+    def _normalize_zip(cls, v: str | None) -> str | None:
+        return normalize_us_zip(v)
 
     @model_validator(mode="after")
     def _check_age_pair(self) -> "BusinessUpdate":

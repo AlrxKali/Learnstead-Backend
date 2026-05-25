@@ -1,8 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from supabase import Client
 
-from app.dependencies import get_supabase, get_supabase_admin
-from app.schemas.auth import AuthResponse, LoginRequest, ProfileOut, SignUpRequest
+from app.dependencies import get_authenticated_supabase, get_current_user, get_supabase, get_supabase_admin
+from app.schemas.auth import (
+    AuthResponse,
+    LoginRequest,
+    ProfileOut,
+    ProfileUpdate,
+    SignUpRequest,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -19,6 +25,12 @@ def signup(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}",
+        )
+
+    if body.role == "parent" and not body.home_zip_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Home zip code is required for parents.",
         )
 
     # Create the auth user via Supabase
@@ -44,6 +56,7 @@ def signup(
         "id": user_id,
         "role": body.role,
         "full_name": body.full_name,
+        "home_zip_code": body.home_zip_code,
     }
 
     try:
@@ -110,3 +123,48 @@ def login(
         refresh_token=auth_response.session.refresh_token,
         user=ProfileOut(**profile),
     )
+
+
+@router.get("/me", response_model=ProfileOut)
+def get_me(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    response = (
+        supabase.table("profiles")
+        .select("*")
+        .eq("id", str(user.id))
+        .execute()
+    )
+    if not response.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found",
+        )
+    return response.data[0]
+
+
+@router.patch("/me", response_model=ProfileOut)
+def update_me(
+    body: ProfileUpdate,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    updates = body.model_dump(exclude_unset=True, mode="json")
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No fields to update",
+        )
+    response = (
+        supabase.table("profiles")
+        .update(updates)
+        .eq("id", str(user.id))
+        .execute()
+    )
+    if not response.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found",
+        )
+    return response.data[0]
