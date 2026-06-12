@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import auth, businesses
+from app.routers import auth, businesses, planner
 
 app = FastAPI(title="Learnstead API", version="0.1.0")
 
@@ -15,3 +15,4 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(businesses.router)
+app.include_router(planner.router)
