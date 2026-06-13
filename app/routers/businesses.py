@@ -186,6 +186,84 @@ def unlink_subcategory_from_category(
         )
 
 
+@router.get("/search", response_model=list[BusinessOut])
+def search_businesses(
+    q: str | None = Query(None),
+    category_id: UUID | None = Query(None),
+    subcategory_id: list[UUID] | None = Query(None),
+    delivery_mode: list[str] | None = Query(None),
+    age: int | None = Query(None, ge=0, le=99),
+    zip_prefix: str | None = Query(None, min_length=3, max_length=3),
+    limit: int = Query(50, ge=1, le=200),
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    """Open-ended search over businesses.
+
+    Differs from /discover by NOT applying parent's home_zip_code implicitly.
+    Locality is opt-in via the explicit zip_prefix param.
+
+    Filters (all optional, AND-combined):
+      - q: case-insensitive substring match on name OR description
+      - category_id: exact match
+      - subcategory_id: business must link to ANY of these subcategories
+      - delivery_mode: business must be one of these modes
+      - age: program must serve this age (NULL bounds = open-ended)
+      - zip_prefix: first 3 digits of zip must match (in_person / hybrid only;
+        online businesses are always included)
+    """
+    # Subcategory pre-filter: collect matching business_ids first, since the
+    # link lives in a junction table.
+    business_id_filter: list[str] | None = None
+    if subcategory_id:
+        links = (
+            supabase.table("business_subcategory")
+            .select("business_id")
+            .in_("subcategory_id", [str(s) for s in subcategory_id])
+            .execute()
+        )
+        ids = list({row["business_id"] for row in links.data or []})
+        if not ids:
+            return []
+        business_id_filter = ids
+
+    query = supabase.table("businesses").select("*, business_categories(*)")
+
+    if business_id_filter is not None:
+        query = query.in_("id", business_id_filter)
+    if category_id is not None:
+        query = query.eq("category_id", str(category_id))
+    if delivery_mode:
+        query = query.in_("delivery_mode", delivery_mode)
+    if age is not None:
+        # min_age IS NULL OR min_age <= age
+        query = query.or_(f"min_age.is.null,min_age.lte.{age}")
+        # max_age IS NULL OR max_age >= age
+        query = query.or_(f"max_age.is.null,max_age.gte.{age}")
+    if q:
+        like = f"*{q}*"
+        query = query.or_(f"name.ilike.{like},description.ilike.{like}")
+    if zip_prefix:
+        # online is always included; in_person/hybrid must match zip prefix.
+        query = query.or_(
+            f"delivery_mode.eq.online,"
+            f"and(delivery_mode.in.(in_person,hybrid),zip_code.like.{zip_prefix}*)"
+        )
+
+    rows = (
+        query.order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+    )
+
+    out: list[dict] = []
+    for row in rows:
+        row["category"] = row.pop("business_categories", None)
+        out.append(_enrich_with_subcategories(supabase, row))
+    return out
+
+
 @router.get("/discover", response_model=list[BusinessOut])
 def discover_businesses(
     q: str | None = Query(None),
