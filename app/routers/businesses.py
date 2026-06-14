@@ -451,6 +451,93 @@ def update_my_business(
     return _enrich(supabase, response.data[0])
 
 
+@router.get("/saved", response_model=list[BusinessOut])
+def list_saved(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    """Businesses the current user has saved, newest-saved first."""
+    saved = (
+        supabase.table("saved_businesses")
+        .select("business_id, saved_at")
+        .eq("parent_id", str(user.id))
+        .order("saved_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    if not saved:
+        return []
+    ids = [row["business_id"] for row in saved]
+    rows = (
+        supabase.table("businesses")
+        .select("*, business_categories(*)")
+        .in_("id", ids)
+        .execute()
+        .data
+        or []
+    )
+    # Preserve saved_at order.
+    by_id = {r["id"]: r for r in rows}
+    ordered = [by_id[i] for i in ids if i in by_id]
+    out: list[dict] = []
+    for r in ordered:
+        r["category"] = r.pop("business_categories", None)
+        out.append(_enrich_with_subcategories(supabase, r))
+    return out
+
+
+@router.get("/saved/ids", response_model=list[str])
+def list_saved_ids(
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    """Just the business IDs — used to know which heart icons to fill."""
+    rows = (
+        supabase.table("saved_businesses")
+        .select("business_id")
+        .eq("parent_id", str(user.id))
+        .execute()
+        .data
+        or []
+    )
+    return [r["business_id"] for r in rows]
+
+
+@router.put("/saved/{business_id}", status_code=status.HTTP_204_NO_CONTENT)
+def save_business(
+    business_id: UUID,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    try:
+        supabase.table("saved_businesses").insert({
+            "parent_id": str(user.id),
+            "business_id": str(business_id),
+        }).execute()
+    except APIError as e:
+        # Already saved (composite PK violation) is a no-op success.
+        if e.code == "23505":
+            return
+        if e.code == "23503":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Business not found",
+            ) from e
+        raise
+
+
+@router.delete("/saved/{business_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unsave_business(
+    business_id: UUID,
+    user: dict = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_supabase),
+):
+    supabase.table("saved_businesses").delete().eq(
+        "parent_id", str(user.id)
+    ).eq("business_id", str(business_id)).execute()
+
+
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 def delete_my_business(
     user: dict = Depends(get_current_user),
